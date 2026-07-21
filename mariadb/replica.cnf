@@ -1,0 +1,71 @@
+# =============================================================================
+# MARIADB - NODO REPLICA
+# Proyecto Semestral - Seguridad en los Sistemas de Informacion - UTP FISC
+#
+# Copia en caliente del nodo primario. No recibe escrituras de la aplicacion.
+# =============================================================================
+[mysqld]
+# Identificador unico, distinto del primario.
+server-id = 2
+# -----------------------------------------------------------------------------
+# REGISTRO DE RETRANSMISION (RELAY LOG)
+# -----------------------------------------------------------------------------
+# La replica descarga los eventos del binlog del primario y los deposita en su
+# relay log; luego un hilo independiente los aplica sobre sus propios datos.
+# -----------------------------------------------------------------------------
+relay-log = relay-bin
+relay-log-index = relay-bin.index
+# -----------------------------------------------------------------------------
+# MODO SOLO LECTURA
+# -----------------------------------------------------------------------------
+# read_only impide que cualquier usuario sin privilegio SUPER escriba en este
+# nodo. Es una salvaguarda esencial: una escritura accidental en la replica la
+# desincroniza del primario y rompe la replicacion de forma silenciosa, que es
+# el modo de fallo mas comun -y mas dificil de diagnosticar- de este montaje.
+#
+# El hilo de replicacion SI puede escribir, porque opera con privilegios
+# internos que no estan sujetos a esta restriccion.
+# -----------------------------------------------------------------------------
+read_only = 1
+# -----------------------------------------------------------------------------
+# REGISTRO DE LOS CAMBIOS REPLICADOS
+# -----------------------------------------------------------------------------
+# Hace que la replica escriba en su propio binlog los cambios que recibe. Tiene
+# un objetivo concreto de continuidad: si el primario cae de forma permanente,
+# esta replica puede ser promovida a primario y ya cuenta con el binlog activo
+# para alimentar, a su vez, a un nuevo nodo replica.
+# -----------------------------------------------------------------------------
+log-bin = mysql-bin
+log_slave_updates = 1
+# -----------------------------------------------------------------------------
+# INTEGRIDAD DE LA POSICION DE REPLICACION
+# -----------------------------------------------------------------------------
+# Almacena la posicion de lectura dentro de una tabla InnoDB transaccional en
+# lugar de un archivo de texto plano. Asi, la posicion se confirma en la MISMA
+# transaccion que aplica los datos.
+#
+# Sin esto, un corte de energia entre "aplicar el dato" y "guardar la posicion"
+# provoca que al reiniciar la replica reaplique eventos ya procesados y corrompa
+# la copia.
+# -----------------------------------------------------------------------------
+relay_log_info_repository = TABLE
+relay_log_recovery = 1
+# -----------------------------------------------------------------------------
+# MOTOR Y RECURSOS
+# -----------------------------------------------------------------------------
+default_storage_engine = InnoDB
+innodb_flush_log_at_trx_commit = 1
+# Se asigna menos memoria que al primario: la replica no atiende el trafico de
+# la aplicacion, solo aplica los cambios que recibe.
+innodb_buffer_pool_size = 256M
+innodb_log_file_size = 128M
+innodb_file_per_table = 1
+# -----------------------------------------------------------------------------
+# SEGURIDAD
+# -----------------------------------------------------------------------------
+bind-address = 0.0.0.0
+local-infile = 0
+skip-name-resolve = 1
+character-set-server = utf8mb4
+collation-server = utf8mb4_unicode_ci
+max_connections = 50

@@ -1,0 +1,70 @@
+# =============================================================================
+# ARCHIVOS EXCLUIDOS DEL CONTROL DE VERSIONES
+# Proyecto Semestral - Seguridad en los Sistemas de Informacion - UTP FISC
+# =============================================================================
+# -----------------------------------------------------------------------------
+# SECRETOS -- LA EXCLUSION MAS IMPORTANTE DE ESTE ARCHIVO
+# -----------------------------------------------------------------------------
+# Una credencial subida a Git queda en el historial de forma permanente. Borrarla
+# en un commit posterior NO la elimina: sigue siendo recuperable con
+# "git log -p". La unica remediacion real es rotar la credencial expuesta.
+# -----------------------------------------------------------------------------
+.env
+.env.local
+.env.produccion
+*.env
+!.env.example
+# -----------------------------------------------------------------------------
+# MATERIAL CRIPTOGRAFICO
+# -----------------------------------------------------------------------------
+# Las llaves privadas y los certificados se generan en el servidor durante el
+# arranque. Jamas se versionan.
+# -----------------------------------------------------------------------------
+*.key
+*.pem
+*.crt
+*.csr
+*.p12
+*.pfx
+certs/
+nginx/certs/
+# -----------------------------------------------------------------------------
+# LLAVES DE ACCESO
+# -----------------------------------------------------------------------------
+*.ppk
+labsuser.pem
+id_rsa
+id_rsa.pub
+*.ovpn
+# -----------------------------------------------------------------------------
+# RESPALDOS Y VOLCADOS DE BASE DE DATOS
+# -----------------------------------------------------------------------------
+# Contienen datos de usuarios y hashes de contrasena. Nunca deben salir del
+# servidor por la via del repositorio.
+# -----------------------------------------------------------------------------
+respaldos/
+backups/
+*.sql
+*.sql.gz
+*.dump
+# -----------------------------------------------------------------------------
+# REGISTROS
+# -----------------------------------------------------------------------------
+logs/
+*.log
+# -----------------------------------------------------------------------------
+# ARCHIVOS DEL SISTEMA OPERATIVO Y EDITORES
+# -----------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*~
+# -----------------------------------------------------------------------------
+# TEMPORALES
+# -----------------------------------------------------------------------------
+tmp/
+temp/
+*.tmp

@@ -1,0 +1,283 @@
+# =============================================================================
+# PROYECTO SEMESTRAL - SEGURIDAD EN LOS SISTEMAS DE INFORMACION
+# Universidad Tecnologica de Panama - FISC
+#
+# Arquitectura multicapa con alta disponibilidad sobre una instancia EC2.
+#   Internet (solo 443/tcp)
+#        |
+#     [ nginx ]                <- balanceador de carga + terminacion TLS 1.2
+#      /     \
+#   [ wp1 ] [ wp2 ]            <- capa de aplicacion (red frontend + backend)
+#      \     /
+#   [ mariadb-primary ] --binlog--> [ mariadb-replica ]
+#        |
+#     [ redis ]                <- cache de objetos
+#
+# La red "backend" es interna (internal: true): los contenedores de datos
+# NO tienen ruta hacia Internet ni son alcanzables desde el exterior.
+# =============================================================================
+name: proyecto-seguridad
+
+services:
+
+  # ===========================================================================
+  # SERVICIO 0 - GENERACION DEL CERTIFICADO TLS AUTOFIRMADO
+  # Se ejecuta una sola vez en cada arranque, ANTES que nginx. Detecta la IP
+  # publica actual (IMDSv2) y emite un certificado de 4096 bits con esa IP en
+  # el campo SAN. Resuelve el cambio de IP del AWS Academy Learner Lab.
+  # ===========================================================================
+  certgen:
+    image: alpine:3.20
+    container_name: sec_certgen
+    volumes:
+      - certs:/certs
+      - ./scripts/generar-cert.sh:/generar-cert.sh:ro
+    environment:
+      CERT_BITS: ${CERT_BITS:-4096}
+      CERT_DAYS: ${CERT_DAYS:-365}
+      CERT_IP_MANUAL: ${CERT_IP_MANUAL:-}
+      CERT_PAIS: ${CERT_PAIS:-PA}
+      CERT_ORG: ${CERT_ORG:-UTP-FISC}
+    entrypoint: ["/bin/sh", "/generar-cert.sh"]
+    networks:
+      - frontend
+
+  # ===========================================================================
+  # CAPA 1 - BALANCEADOR DE CARGA Y TERMINACION TLS
+  # Unico servicio expuesto a Internet.
+  # ===========================================================================
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: sec_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"      # unicamente para redireccion 301 hacia HTTPS
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - certs:/etc/nginx/certs:ro
+    networks:
+      - frontend
+    depends_on:
+      certgen:
+        condition: service_completed_successfully
+      wordpress1:
+        condition: service_started
+      wordpress2:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+
+  # ===========================================================================
+  # CAPA 2 - APLICACION (WORDPRESS, DOS INSTANCIAS)
+  # Ambas se construyen desde la MISMA imagen inmutable y comparten base de
+  # datos, cache y volumen de uploads. Toda credencial entra por variables de
+  # entorno. wordpress2 hereda la definicion con un ancla YAML.
+  # ===========================================================================
+  wordpress1: &wordpress_base
+    build:
+      context: ./wordpress
+      dockerfile: Dockerfile
+    image: ${IMAGEN_WORDPRESS:-proyecto-seguridad-wp:local}
+    container_name: sec_wordpress1
+    restart: unless-stopped
+    environment:
+      WORDPRESS_DB_HOST: mariadb-primary:3306
+      WORDPRESS_DB_NAME: ${MYSQL_DATABASE}
+      WORDPRESS_DB_USER: ${MYSQL_USER}
+      WORDPRESS_DB_PASSWORD: ${MYSQL_PASSWORD}
+      WORDPRESS_TABLE_PREFIX: ${WP_TABLE_PREFIX:-wp_}
+      WORDPRESS_CONFIG_EXTRA: |
+        /* Deteccion correcta de HTTPS detras del balanceador */
+        if (isset($$_SERVER['HTTP_X_FORWARDED_PROTO'])
+            && $$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+          $$_SERVER['HTTPS'] = 'on';
+        }
+        define('WP_HOME', '${WP_URL}');
+        define('WP_SITEURL', '${WP_URL}');
+        /* Cache de objetos en Redis */
+        define('WP_REDIS_HOST', 'redis');
+        define('WP_REDIS_PORT', 6379);
+        define('WP_REDIS_PASSWORD', '${REDIS_PASSWORD}');
+        define('WP_REDIS_TIMEOUT', 1);
+        define('WP_REDIS_DATABASE', 0);
+        define('WP_CACHE', true);
+        /* Endurecimiento de WordPress */
+        define('DISALLOW_FILE_EDIT', true);
+        define('DISALLOW_FILE_MODS', true);
+        define('FORCE_SSL_ADMIN', true);
+        define('WP_AUTO_UPDATE_CORE', 'minor');
+        define('WP_DEBUG', false);
+        define('WP_DEBUG_DISPLAY', false);
+      WORDPRESS_AUTH_KEY: ${WP_AUTH_KEY}
+      WORDPRESS_SECURE_AUTH_KEY: ${WP_SECURE_AUTH_KEY}
+      WORDPRESS_LOGGED_IN_KEY: ${WP_LOGGED_IN_KEY}
+      WORDPRESS_NONCE_KEY: ${WP_NONCE_KEY}
+      WORDPRESS_AUTH_SALT: ${WP_AUTH_SALT}
+      WORDPRESS_SECURE_AUTH_SALT: ${WP_SECURE_AUTH_SALT}
+      WORDPRESS_LOGGED_IN_SALT: ${WP_LOGGED_IN_SALT}
+      WORDPRESS_NONCE_SALT: ${WP_NONCE_SALT}
+      NODO_APP: "wordpress1"
+    volumes:
+      - uploads:/var/www/html/wp-content/uploads
+    networks:
+      - frontend
+      - backend
+    depends_on:
+      mariadb-primary:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost/wp-includes/js/wp-emoji-loader.min.js"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  wordpress2:
+    <<: *wordpress_base
+    container_name: sec_wordpress2
+    environment:
+      WORDPRESS_DB_HOST: mariadb-primary:3306
+      WORDPRESS_DB_NAME: ${MYSQL_DATABASE}
+      WORDPRESS_DB_USER: ${MYSQL_USER}
+      WORDPRESS_DB_PASSWORD: ${MYSQL_PASSWORD}
+      WORDPRESS_TABLE_PREFIX: ${WP_TABLE_PREFIX:-wp_}
+      WORDPRESS_CONFIG_EXTRA: |
+        if (isset($$_SERVER['HTTP_X_FORWARDED_PROTO'])
+            && $$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+          $$_SERVER['HTTPS'] = 'on';
+        }
+        define('WP_HOME', '${WP_URL}');
+        define('WP_SITEURL', '${WP_URL}');
+        define('WP_REDIS_HOST', 'redis');
+        define('WP_REDIS_PORT', 6379);
+        define('WP_REDIS_PASSWORD', '${REDIS_PASSWORD}');
+        define('WP_REDIS_TIMEOUT', 1);
+        define('WP_REDIS_DATABASE', 0);
+        define('WP_CACHE', true);
+        define('DISALLOW_FILE_EDIT', true);
+        define('DISALLOW_FILE_MODS', true);
+        define('FORCE_SSL_ADMIN', true);
+        define('WP_AUTO_UPDATE_CORE', 'minor');
+        define('WP_DEBUG', false);
+        define('WP_DEBUG_DISPLAY', false);
+      WORDPRESS_AUTH_KEY: ${WP_AUTH_KEY}
+      WORDPRESS_SECURE_AUTH_KEY: ${WP_SECURE_AUTH_KEY}
+      WORDPRESS_LOGGED_IN_KEY: ${WP_LOGGED_IN_KEY}
+      WORDPRESS_NONCE_KEY: ${WP_NONCE_KEY}
+      WORDPRESS_AUTH_SALT: ${WP_AUTH_SALT}
+      WORDPRESS_SECURE_AUTH_SALT: ${WP_SECURE_AUTH_SALT}
+      WORDPRESS_LOGGED_IN_SALT: ${WP_LOGGED_IN_SALT}
+      WORDPRESS_NONCE_SALT: ${WP_NONCE_SALT}
+      NODO_APP: "wordpress2"
+
+  # ===========================================================================
+  # CAPA 3 - BASE DE DATOS PRIMARIA (recibe escrituras, binlog activo)
+  # No publica puertos: solo alcanzable desde la red interna "backend".
+  # ===========================================================================
+  mariadb-primary:
+    image: mariadb:11.4
+    container_name: sec_mariadb_primary
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${MYSQL_DATABASE}
+      MARIADB_USER: ${MYSQL_USER}
+      MARIADB_PASSWORD: ${MYSQL_PASSWORD}
+      REPL_USER: ${REPL_USER}
+      REPL_PASSWORD: ${REPL_PASSWORD}
+    volumes:
+      - db_primary:/var/lib/mysql
+      - ./mariadb/primary.cnf:/etc/mysql/conf.d/primary.cnf:ro
+      - ./mariadb/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  # ===========================================================================
+  # CAPA 3b - BASE DE DATOS REPLICA (copia en caliente de la primaria)
+  # ===========================================================================
+  mariadb-replica:
+    image: mariadb:11.4
+    container_name: sec_mariadb_replica
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - db_replica:/var/lib/mysql
+      - ./mariadb/replica.cnf:/etc/mysql/conf.d/replica.cnf:ro
+    networks:
+      - backend
+    depends_on:
+      mariadb-primary:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  # ===========================================================================
+  # CAPA 4 - CACHE DE OBJETOS (Redis, con contrasena, sin puerto expuesto)
+  # ===========================================================================
+  redis:
+    image: redis:7.4-alpine
+    container_name: sec_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 128mb
+      --maxmemory-policy allkeys-lru
+      --appendonly no
+      --save ""
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+# =============================================================================
+# REDES - SEGMENTACION
+#   frontend : nginx <-> wordpress. Tiene salida a Internet.
+#   backend  : wordpress <-> mariadb/redis. Interna, sin ruta de salida.
+# =============================================================================
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true
+
+volumes:
+  db_primary:
+  db_replica:
+  redis_data:
+  uploads:
+  certs:

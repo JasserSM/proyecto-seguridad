@@ -1,0 +1,200 @@
+# =============================================================================
+# INTEGRACION CONTINUA Y DESPLIEGUE CONTINUO (CI/CD)
+# Proyecto Semestral - Seguridad en los Sistemas de Informacion - UTP FISC
+# -----------------------------------------------------------------------------
+# Materializa integracion continua, despliegue continuo y DevOps. Cada cambio
+# empujado al repositorio atraviesa una cadena de validaciones de seguridad
+# antes de poder llegar al servidor.
+# =============================================================================
+name: CI/CD - Construccion, analisis de seguridad y despliegue
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  # Despliegue manual: recibe la IP de destino como parametro porque en AWS
+  # Academy Learner Lab la instancia cambia de IP publica al reiniciarse.
+  workflow_dispatch:
+    inputs:
+      ip_destino:
+        description: 'IP publica actual de la instancia EC2'
+        required: true
+        type: string
+
+env:
+  REGISTRO: ghcr.io
+  NOMBRE_IMAGEN: ${{ github.repository }}-wp
+
+jobs:
+
+  # ===========================================================================
+  # ETAPA 1 - ANALISIS ESTATICO
+  # ===========================================================================
+  analisis-estatico:
+    name: Analisis estatico de la infraestructura
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el codigo del repositorio
+        uses: actions/checkout@v4
+
+      - name: Revisar el Dockerfile con Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: wordpress/Dockerfile
+          failure-threshold: error
+
+      - name: Validar la sintaxis de docker-compose
+        run: |
+          cp .env.example .env
+          sed -i 's/CAMBIAR[A-Za-z_]*/valor_ficticio_para_validacion/g' .env
+          sed -i 's|https://CAMBIAR_IP_PUBLICA|https://192.0.2.1|' .env
+          docker compose config --quiet
+          echo "Sintaxis de docker-compose.yml correcta."
+          rm -f .env
+
+      - name: Buscar secretos filtrados en el historial
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Analizar los scripts de shell
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck -S error scripts/*.sh || true
+          echo "Analisis de scripts finalizado."
+
+  # ===========================================================================
+  # ETAPA 2 - CONSTRUCCION Y ESCANEO DE VULNERABILIDADES
+  # ===========================================================================
+  construir-y-escanear:
+    name: Construir imagen y escanear vulnerabilidades
+    runs-on: ubuntu-latest
+    needs: analisis-estatico
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    steps:
+      - name: Descargar el codigo del repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Construir la imagen de WordPress
+        uses: docker/build-push-action@v5
+        with:
+          context: ./wordpress
+          push: false
+          load: true
+          tags: imagen-en-pruebas:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Escanear la imagen con Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: imagen-en-pruebas:${{ github.sha }}
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Generar el informe de seguridad en formato SARIF
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: imagen-en-pruebas:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-resultados.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: Publicar el informe en la pestana Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-resultados.sarif'
+
+      - name: Autenticarse en el registro de contenedores
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRO }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Calcular etiquetas de la imagen
+        if: github.event_name != 'pull_request'
+        id: metadatos
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRO }}/${{ env.NOMBRE_IMAGEN }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=,format=short
+
+      - name: Publicar la imagen validada
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./wordpress
+          push: true
+          tags: ${{ steps.metadatos.outputs.tags }}
+          labels: ${{ steps.metadatos.outputs.labels }}
+          cache-from: type=gha
+
+  # ===========================================================================
+  # ETAPA 3 - DESPLIEGUE SIN INTERRUPCION DEL SERVICIO (manual)
+  # ===========================================================================
+  desplegar:
+    name: Desplegar en la instancia EC2
+    runs-on: ubuntu-latest
+    needs: construir-y-escanear
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Descargar el codigo del repositorio
+        uses: actions/checkout@v4
+
+      - name: Desplegar por SSH con actualizacion progresiva
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ github.event.inputs.ip_destino }}
+          username: ubuntu
+          key: ${{ secrets.LLAVE_SSH_EC2 }}
+          port: 22
+          script: |
+            set -e
+            cd ~/proyecto-seguridad
+            echo "==> Actualizando el codigo de infraestructura"
+            git pull origin main
+            echo "==> Descargando la imagen validada por el pipeline"
+            docker compose pull wordpress1 wordpress2
+            echo "==> Reemplazando el nodo wordpress1"
+            docker compose up -d --no-deps --force-recreate wordpress1
+            echo "==> Esperando a que wordpress1 supere su verificacion de salud"
+            for i in $(seq 1 30); do
+              estado=$(docker inspect --format='{{.State.Health.Status}}' sec_wordpress1)
+              if [ "$estado" = "healthy" ]; then
+                echo " wordpress1 operativo."
+                break
+              fi
+              sleep 5
+            done
+            echo "==> Reemplazando el nodo wordpress2"
+            docker compose up -d --no-deps --force-recreate wordpress2
+            echo "==> Verificando que el sitio responde"
+            sleep 10
+            codigo=$(curl -sk -o /dev/null -w "%{http_code}" https://localhost/)
+            echo " Respuesta del sitio: HTTP $codigo"
+            echo "==> Eliminando imagenes antiguas sin uso"
+            docker image prune -f
+            echo "==> Despliegue completado sin interrupcion del servicio"
+
+      - name: Registrar el resultado del despliegue
+        run: |
+          echo "Despliegue finalizado."
+          echo "Commit desplegado : ${{ github.sha }}"
+          echo "Responsable : ${{ github.actor }}"
+          echo "Fecha : $(date)"

@@ -1,0 +1,105 @@
+# =============================================================================
+# MARIADB - NODO PRIMARIO
+# Proyecto Semestral - Seguridad en los Sistemas de Informacion - UTP FISC
+#
+# Este nodo recibe TODAS las escrituras de WordPress y actua como origen de la
+# replicacion hacia el nodo replica.
+# =============================================================================
+[mysqld]
+# -----------------------------------------------------------------------------
+# IDENTIDAD EN LA TOPOLOGIA DE REPLICACION
+# -----------------------------------------------------------------------------
+# Cada nodo necesita un identificador numerico unico. Si dos nodos comparten
+# server-id, la replicacion entra en un bucle de eventos y se detiene.
+server-id = 1
+# -----------------------------------------------------------------------------
+# REGISTRO BINARIO (BINLOG)
+# -----------------------------------------------------------------------------
+# El binlog es el diario de todos los cambios aplicados a los datos. Cumple dos
+# funciones simultaneas en este proyecto:
+#
+# 1. DISPONIBILIDAD: es el flujo que consume la replica para mantenerse
+# sincronizada.
+#
+# 2. INTEGRIDAD: habilita la recuperacion a un punto en el tiempo
+# (Point-In-Time Recovery). Sin binlog solo se podria restaurar el ultimo
+# respaldo completo, con una perdida potencial de hasta 24 horas de datos
+# (RPO de 24 h). Con binlog, se restaura el respaldo y luego se reaplican
+# los cambios hasta el segundo anterior al incidente: el RPO baja
+# practicamente a cero.
+#
+# Escenario concreto: un administrador borra por error 200 articulos a las
+# 15:40. Con binlog se restaura el estado exacto de las 15:39 sin perder el
+# trabajo del resto del dia.
+# -----------------------------------------------------------------------------
+log-bin = mysql-bin
+log-bin-index = mysql-bin.index
+# ROW registra el valor final de cada fila afectada, en lugar de la sentencia
+# SQL que la produjo. Es el formato mas seguro: las sentencias no deterministas
+# (por ejemplo, las que usan NOW() o UUID()) generarian resultados distintos en
+# la replica si se replicara la sentencia en si.
+binlog_format = ROW
+# Retencion del binlog. Siete dias es un equilibrio entre la ventana de
+# recuperacion disponible y el consumo de disco.
+expire_logs_days = 7
+max_binlog_size = 100M
+# Solo se replica la base de datos de la aplicacion. Las tablas internas de
+# MariaDB (mysql, information_schema) no deben viajar a la replica.
+binlog_do_db = wordpress_db
+# Durabilidad: se escribe el binlog a disco en cada transaccion. Cuesta algo de
+# rendimiento, pero garantiza que ninguna transaccion confirmada se pierda ante
+# una caida abrupta del proceso.
+sync_binlog = 1
+# -----------------------------------------------------------------------------
+# MOTOR DE ALMACENAMIENTO
+# -----------------------------------------------------------------------------
+default_storage_engine = InnoDB
+# ACID completo: cada transaccion confirmada se vuelca a disco inmediatamente.
+innodb_flush_log_at_trx_commit = 1
+# Memoria dedicada a datos e indices. Se asignan 512 MB dentro del presupuesto
+# de 4 GB de la instancia t3.medium, dejando espacio para la replica, los dos
+# contenedores WordPress, Redis y el sistema operativo.
+innodb_buffer_pool_size = 512M
+innodb_log_file_size = 128M
+innodb_file_per_table = 1
+# -----------------------------------------------------------------------------
+# SEGURIDAD
+# -----------------------------------------------------------------------------
+# Escucha en todas las interfaces del contenedor, pero el servicio NO publica
+# ningun puerto hacia el host y vive en una red Docker declarada "internal".
+# El aislamiento lo provee la capa de red, no la configuracion del motor.
+bind-address = 0.0.0.0
+# Desactiva LOAD DATA LOCAL INFILE. Esta funcion permite que el servidor
+# solicite al cliente el contenido de un archivo local; combinada con una
+# inyeccion SQL, puede usarse para leer archivos del sistema. WordPress no la
+# necesita.
+local-infile = 0
+# Impide la resolucion DNS inversa de las conexiones entrantes. Ademas de
+# mejorar el rendimiento, evita que una respuesta DNS manipulada altere la
+# evaluacion de los permisos basados en nombre de host.
+skip-name-resolve = 1
+# Impide cargar bibliotecas compartidas arbitrarias como funciones definidas por
+# el usuario. Es una via conocida de ejecucion de codigo tras comprometer una
+# cuenta con privilegios.
+# (En MariaDB reciente se controla con el plugin de servidor; se documenta la
+# intencion y se refuerza con el principio de minimo privilegio del usuario
+# de la aplicacion, que NO tiene privilegio FILE ni SUPER.)
+# -----------------------------------------------------------------------------
+# REGISTRO PARA AUDITORIA
+# -----------------------------------------------------------------------------
+# Registra las consultas anormalmente lentas. Sirve para el ajuste de
+# rendimiento y tambien como senal de seguridad: una inyeccion SQL a ciegas
+# basada en tiempo (time-based blind SQLi) genera consultas de varios segundos
+# que quedan aqui registradas.
+slow_query_log = 1
+slow_query_log_file = /var/log/mysql/consultas-lentas.log
+long_query_time = 2
+# -----------------------------------------------------------------------------
+# JUEGO DE CARACTERES
+# -----------------------------------------------------------------------------
+# utf8mb4 es el UTF-8 real de 4 bytes. El antiguo "utf8" de MySQL solo cubre 3
+# bytes y trunca los caracteres fuera del plano basico, lo que ademas de romper
+# emojis ha sido vector de ataques de truncamiento de cadenas.
+character-set-server = utf8mb4
+collation-server = utf8mb4_unicode_ci
+max_connections = 100
