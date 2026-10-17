@@ -1,4 +1,4 @@
-[README-seguridad.md](https://github.com/user-attachments/files/33583594/README-seguridad.md)
+[README.md](https://github.com/user-attachments/files/33583594/README-seguridad.md)
 # Infraestructura Web Endurecida con Alta Disponibilidad y Despliegue Continuo
 
 Implementación de una infraestructura WordPress endurecida sobre AWS EC2, diseñada bajo los tres pilares de la seguridad de la información (confidencialidad, integridad y disponibilidad). Combina alta disponibilidad, infraestructura inmutable, segmentación de red y un canal de CI/CD con controles de seguridad obligatorios.
